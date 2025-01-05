@@ -5,21 +5,56 @@ use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
     style::{
-        palette::tailwind::GREEN, palette::tailwind::SLATE, palette::tailwind::WHITE, Modifier,
-        Style, Stylize,
+        palette::tailwind::{GREEN, RED, SLATE, WHITE},
+        Modifier, Style, Stylize,
     },
     widgets::{
-        Block, HighlightSpacing, List, ListItem, ListState, Paragraph, StatefulWidget, Widget,
+        Block, Borders, HighlightSpacing, List, ListItem, ListState, Paragraph, StatefulWidget,
+        Widget,
     },
     DefaultTerminal,
 };
 
 use git2::{Branch, Repository};
 
+#[derive(Default)]
+enum StatusType {
+    #[default]
+    Info,
+    Success,
+    Error,
+}
+
+impl StatusType {
+    fn get_emoji(&self) -> &'static str {
+        match self {
+            StatusType::Info => "ℹ️ ",
+            StatusType::Success => "✅",
+            StatusType::Error => "❌",
+        }
+    }
+}
+struct OperationStatus {
+    message: String,
+    status_type: StatusType,
+    timestamp: std::time::Instant,
+}
+
+impl Default for OperationStatus {
+    fn default() -> Self {
+        Self {
+            message: String::new(),
+            status_type: StatusType::default(),
+            timestamp: std::time::Instant::now(),
+        }
+    }
+}
+
 pub struct App<'repo> {
     branch_manager: BranchManager<'repo>,
     state: ListState,
     exit: bool,
+    operation_status: OperationStatus,
 }
 
 impl<'a> Widget for &mut App<'a> {
@@ -31,7 +66,12 @@ impl<'a> Widget for &mut App<'a> {
         ])
         .areas(area);
 
-        self.render_header(header_area, buf);
+        let [title_area, status_area] =
+            Layout::horizontal([Constraint::Percentage(30), Constraint::Fill(1)])
+                .areas(header_area);
+
+        self.render_header(title_area, buf);
+        self.render_status(status_area, buf);
         self.render_body(main_area, buf);
         self.render_footer(footer_area, buf);
     }
@@ -49,6 +89,7 @@ impl<'repo> App<'repo> {
             state: ListState::default().with_selected(Some(0)),
             exit: false,
             branch_manager,
+            operation_status: OperationStatus::default(),
         })
     }
 
@@ -68,17 +109,59 @@ impl<'repo> App<'repo> {
             Err(_) => "ERROR".to_string(),
         };
 
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(WHITE));
+
         Paragraph::new(format!(
             "Git Branch Explorer ({} {})",
             BRANCH_EMOJI, current_branch
         ))
+        .block(block)
         .bold()
         .centered()
         .render(area, buf);
     }
 
+    fn set_status(&mut self, message: &str, status_type: StatusType) {
+        self.operation_status = OperationStatus {
+            message: message.to_string(),
+            status_type,
+            timestamp: std::time::Instant::now(),
+        }
+    }
+
+    fn render_status(&mut self, area: Rect, buf: &mut Buffer) {
+        if self.operation_status.timestamp.elapsed().as_secs() > 3
+            && !self.operation_status.message.is_empty()
+        {
+            self.operation_status = OperationStatus::default();
+        }
+
+        let style = match self.operation_status.status_type {
+            StatusType::Info => Style::default().fg(WHITE),
+            StatusType::Success => Style::default().fg(GREEN.c500),
+            StatusType::Error => Style::default().fg(RED.c500),
+        };
+
+        let emoji = self.operation_status.status_type.get_emoji();
+        let status_text = if self.operation_status.message.is_empty() {
+            "Ready".to_string()
+        } else {
+            format!("{} {}", emoji, self.operation_status.message)
+        };
+
+        let block = Block::default().borders(Borders::ALL).border_style(style);
+
+        Paragraph::new(status_text)
+            .style(style)
+            .block(block)
+            .centered()
+            .render(area, buf);
+    }
+
     fn render_footer(&mut self, area: Rect, buf: &mut Buffer) {
-        Paragraph::new("Switch <s> | Refresh <r> | Quit <q>")
+        Paragraph::new("Switch <s> | Fetch <f> | Refresh <r> | Quit <q>")
             .bold()
             .centered()
             .render(area, buf);
@@ -109,7 +192,12 @@ impl<'repo> App<'repo> {
                     .collect::<Vec<ListItem>>();
 
                 let list = List::new(items)
-                    .block(Block::new())
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .border_style(Style::default().fg(WHITE))
+                            .title("Branches"),
+                    )
                     .highlight_style(SELECTED_STYLE)
                     .highlight_symbol(BRANCH_EMOJI_WITH_SPACE)
                     .highlight_spacing(HighlightSpacing::Always);
@@ -152,21 +240,80 @@ impl<'repo> App<'repo> {
     }
 
     fn switch_branch(&mut self) {
-        if let Some(i) = self.state.selected() {
-            if let Some(branch) = self.branch_manager.local_branches.get(i) {
-                if let Err(e) = self.branch_manager.switch_to_branch(branch) {
-                    eprintln!("Failed to switch branch: {}", e);
-                }
+        let branch_name = self
+            .state
+            .selected()
+            .and_then(|i| self.branch_manager.local_branches.get(i))
+            .and_then(|branch| branch.name().ok().flatten())
+            .unwrap_or("unknown branch")
+            .to_string();
+
+        self.set_status(
+            &format!("Switching to {}...", branch_name),
+            StatusType::Info,
+        );
+
+        let result = self
+            .state
+            .selected()
+            .and_then(|i| self.branch_manager.local_branches.get(i))
+            .map(|branch| self.branch_manager.switch_to_branch(branch));
+
+        match result {
+            Some(Ok(_)) => {
+                self.set_status(
+                    &format!("Successfully switched to branch {}", branch_name),
+                    StatusType::Success,
+                );
+            }
+            Some(Err(e)) => {
+                self.set_status(
+                    &format!("Error switching to {}: {}", branch_name, e),
+                    StatusType::Error,
+                );
+            }
+            None => {
+                self.set_status("No branch selected", StatusType::Info);
             }
         }
     }
 
     fn fetch_branch(&mut self) {
-        if let Some(i) = self.state.selected() {
-            if let Some(branch) = self.branch_manager.local_branches.get(i) {
-                if let Err(e) = self.branch_manager.fetch_on_branch(branch) {
-                    eprintln!("Failed to switch branch: {}", e);
-                }
+        // Get the branch name first, before any status updates
+        let branch_name = self
+            .state
+            .selected()
+            .and_then(|i| self.branch_manager.local_branches.get(i))
+            .and_then(|branch| branch.name().ok().flatten())
+            .unwrap_or("unknown branch")
+            .to_string(); // Clone the string so we own it
+
+        // Now we can update status and use the branch
+        self.set_status(&format!("Fetching {}...", branch_name), StatusType::Info);
+
+        // Perform the fetch operation
+        let result = self
+            .state
+            .selected()
+            .and_then(|i| self.branch_manager.local_branches.get(i))
+            .map(|branch| self.branch_manager.fetch_on_branch(branch));
+
+        // Update status based on result
+        match result {
+            Some(Ok(_)) => {
+                self.set_status(
+                    &format!("Successfully fetched {}", branch_name),
+                    StatusType::Success,
+                );
+            }
+            Some(Err(e)) => {
+                self.set_status(
+                    &format!("Error fetching {}: {}", branch_name, e),
+                    StatusType::Error,
+                );
+            }
+            None => {
+                self.set_status("No branch selected", StatusType::Info);
             }
         }
     }
@@ -232,7 +379,18 @@ impl<'repo> BranchManager<'repo> {
             .name()?
             .ok_or_else(|| git2::Error::from_str("Invalid UTF-8 in branch name."))?;
 
+        let current_head_name = self.get_current_branch()?;
+
+        let statuses = self.repo.statuses(None)?;
+        if !statuses.is_empty() {
+            return Err(git2::Error::from_str(&format!(
+                "Uncommitted local changes on branch {}",
+                current_head_name,
+            )));
+        }
+
         let mut opts = git2::build::CheckoutBuilder::new();
+
         self.repo.set_head(&format!("refs/heads/{}", branch_name))?;
         self.repo.checkout_head(Some(&mut opts))
     }
