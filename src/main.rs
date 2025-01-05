@@ -4,7 +4,10 @@ use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::{
     buffer::Buffer,
     layout::{Constraint, Layout, Rect},
-    style::{palette::tailwind::SLATE, Modifier, Style, Stylize},
+    style::{
+        palette::tailwind::GREEN, palette::tailwind::SLATE, palette::tailwind::WHITE, Modifier,
+        Style, Stylize,
+    },
     widgets::{
         Block, HighlightSpacing, List, ListItem, ListState, Paragraph, StatefulWidget, Widget,
     },
@@ -13,16 +16,10 @@ use ratatui::{
 
 use git2::{Branch, Repository};
 
-pub struct App<'a> {
-    exit: bool,
+pub struct App<'repo> {
+    branch_manager: BranchManager<'repo>,
     state: ListState,
-    explorer: BranchExplorer<'a>,
-}
-
-impl<'a> Default for App<'a> {
-    fn default() -> Self {
-        App::new()
-    }
+    exit: bool,
 }
 
 impl<'a> Widget for &mut App<'a> {
@@ -44,16 +41,15 @@ const SELECTED_STYLE: Style = Style::new().bg(SLATE.c800).add_modifier(Modifier:
 const BRANCH_EMOJI: &str = "";
 const BRANCH_EMOJI_WITH_SPACE: &str = " ";
 
-impl<'a> App<'a> {
-    fn new() -> Self {
-        let mut explorer = BranchExplorer::new().expect("Failed to initialize git repository");
-        explorer.refresh_branches();
+impl<'repo> App<'repo> {
+    fn new(repo: &'repo Repository) -> Result<Self, git2::Error> {
+        let branch_manager = BranchManager::new(repo)?;
 
-        App {
+        Ok(App {
             state: ListState::default().with_selected(Some(0)),
             exit: false,
-            explorer,
-        }
+            branch_manager,
+        })
     }
 
     fn run(mut self, terminal: &mut DefaultTerminal) -> io::Result<()> {
@@ -67,7 +63,7 @@ impl<'a> App<'a> {
     }
 
     fn render_header(&mut self, area: Rect, buf: &mut Buffer) {
-        let current_branch = match self.explorer.get_current_head_branch() {
+        let current_branch = match self.branch_manager.get_current_branch() {
             Ok(name) => name,
             Err(_) => "ERROR".to_string(),
         };
@@ -82,21 +78,33 @@ impl<'a> App<'a> {
     }
 
     fn render_footer(&mut self, area: Rect, buf: &mut Buffer) {
-        Paragraph::new("Switch <s> | Quit <q>")
+        Paragraph::new("Switch <s> | Refresh <r> | Quit <q>")
             .bold()
             .centered()
             .render(area, buf);
     }
 
     fn render_body(&mut self, area: Rect, buf: &mut Buffer) {
-        match self.explorer.get_all_local_branch_names() {
+        match self.branch_manager.get_all_local_branch_names() {
             Ok(branches) => {
+                let current_branch_name = match self.branch_manager.get_current_branch() {
+                    Ok(name) => name,
+                    Err(_) => String::from("None"),
+                };
+
                 let items = branches
                     .iter()
                     .enumerate()
                     .map(|(i, branch_name)| {
-                        let colour = if i % 2 == 0 { SLATE.c950 } else { SLATE.c900 };
-                        ListItem::new(branch_name.clone()).bg(colour)
+                        let bg_colour = if i % 2 == 0 { SLATE.c950 } else { SLATE.c900 };
+                        let text_colour = if branch_name == &current_branch_name {
+                            GREEN.c500
+                        } else {
+                            WHITE
+                        };
+                        ListItem::new(branch_name.clone())
+                            .bg(bg_colour)
+                            .fg(text_colour)
                     })
                     .collect::<Vec<ListItem>>();
 
@@ -126,6 +134,12 @@ impl<'a> App<'a> {
             KeyCode::Char('s') => {
                 self.switch_branch();
             }
+            KeyCode::Char('f') => {
+                self.fetch_branch();
+            }
+            KeyCode::Char('r') => {
+                self.refresh_branches();
+            }
             _ => {}
         }
     }
@@ -139,46 +153,57 @@ impl<'a> App<'a> {
 
     fn switch_branch(&mut self) {
         if let Some(i) = self.state.selected() {
-            if let Err(err) = self.explorer.switch_branch(&self.rendered_branches[i]) {
-                println!("Err {err}");
+            if let Some(branch) = self.branch_manager.local_branches.get(i) {
+                if let Err(e) = self.branch_manager.switch_to_branch(branch) {
+                    eprintln!("Failed to switch branch: {}", e);
+                }
             }
+        }
+    }
+
+    fn fetch_branch(&mut self) {
+        if let Some(i) = self.state.selected() {
+            if let Some(branch) = self.branch_manager.local_branches.get(i) {
+                if let Err(e) = self.branch_manager.fetch_on_branch(branch) {
+                    eprintln!("Failed to switch branch: {}", e);
+                }
+            }
+        }
+    }
+
+    fn refresh_branches(&mut self) {
+        if let Err(e) = self.branch_manager.refresh_branches() {
+            eprintln!("Failed to refresh branches: {}", e);
         }
     }
 }
 
-struct BranchExplorer<'repo> {
-    repo: Repository,
+struct BranchManager<'repo> {
+    repo: &'repo Repository,
     local_branches: Vec<Branch<'repo>>,
-    all_branches: Vec<Branch<'repo>>,
 }
 
-impl<'repo> BranchExplorer<'repo> {
-    fn new() -> Result<Self, git2::Error> {
-        let repo = Repository::open(".")?;
-        Ok(Self {
-            repo,
-            local_branches: Vec::new(),
-            all_branches: Vec::new(),
-        })
-    }
-
-    fn refresh_branches(&'repo mut self) -> Result<(), git2::Error> {
-        let local_branches = self
-            .repo
+impl<'repo> BranchManager<'repo> {
+    fn new(repo: &'repo Repository) -> Result<Self, git2::Error> {
+        let local_branches = repo
             .branches(Some(git2::BranchType::Local))?
             .filter_map(Result::ok)
             .map(|(branch, _)| branch)
             .collect();
 
-        let all_branches = self
+        Ok(Self {
+            repo,
+            local_branches,
+        })
+    }
+
+    fn refresh_branches(&mut self) -> Result<(), git2::Error> {
+        self.local_branches = self
             .repo
-            .branches(None)?
+            .branches(Some(git2::BranchType::Local))?
             .filter_map(Result::ok)
             .map(|(branch, _)| branch)
-            .collect();
-
-        self.local_branches = local_branches;
-        self.all_branches = all_branches;
+            .collect::<Vec<_>>();
         Ok(())
     }
 
@@ -190,58 +215,55 @@ impl<'repo> BranchExplorer<'repo> {
             .collect())
     }
 
-    fn get_current_head_branch(&self) -> Result<String, git2::Error> {
+    fn get_current_branch(&self) -> Result<String, git2::Error> {
         let head = self.repo.head()?;
 
         if head.is_branch() {
-            return Ok(head.shorthand().unwrap_or("HEAD").to_string());
-        }
-
-        // Detached head state
-        let commit = head.peel_to_commit()?;
-        Ok(commit.id().to_string())
-    }
-
-    fn switch_branch(&self, branch_name: &str) -> Result<(), git2::Error> {
-        if self
-            .repo
-            .find_branch(branch_name, git2::BranchType::Local)
-            .is_ok()
-        {
-            let mut opts: git2::build::CheckoutBuilder<'_> = git2::build::CheckoutBuilder::new();
-            self.repo.set_head(&format!("refs/heads/{}", branch_name))?;
-            self.repo.checkout_head(Some(&mut opts))
+            Ok(head.shorthand().unwrap_or("HEAD").to_string())
         } else {
-            Err(git2::Error::from_str(&format!(
-                "Branch '{}' not found",
-                branch_name
-            )))
+            // Detached head state
+            let commit = head.peel_to_commit()?;
+            Ok(commit.id().to_string())
         }
     }
 
-    // fn fetch_branch(&self, branch_name: &str) -> Result<(), git2::Error> {
-    //     self.repo.find_branch(name, branch_type)
-    // }
+    fn switch_to_branch(&self, branch: &Branch) -> Result<(), git2::Error> {
+        let branch_name = branch
+            .name()?
+            .ok_or_else(|| git2::Error::from_str("Invalid UTF-8 in branch name."))?;
+
+        let mut opts = git2::build::CheckoutBuilder::new();
+        self.repo.set_head(&format!("refs/heads/{}", branch_name))?;
+        self.repo.checkout_head(Some(&mut opts))
+    }
+
+    fn fetch_on_branch(&self, branch: &Branch) -> Result<(), git2::Error> {
+        let branch_name = branch
+            .name()?
+            .ok_or_else(|| git2::Error::from_str("Invalid UTF-8 in branch name"))?;
+
+        let mut remote = self.repo.find_remote("origin")?;
+        let refspec = format!(
+            "+refs/heads/{}:refs/remotes/origin/{}",
+            branch_name, branch_name
+        );
+
+        let mut fetch_options = git2::FetchOptions::new();
+        fetch_options.download_tags(git2::AutotagOption::None);
+
+        remote.fetch(&[&refspec], Some(&mut fetch_options), None)?;
+
+        Ok(())
+    }
 }
 
 fn main() -> io::Result<()> {
-    // let explorer = BranchExplorer::new().map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-
-    // explorer
-    //     .get_all_local_branch_names()
-    //     .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?
-    //     .iter()
-    //     .for_each(|f| {
-    //         println!("branch: {f}");
-    //     });
-
-    // if let Err(err) = explorer.switch_branch("branch1") {
-    //     eprintln!("Error when switching branch, exiting. error={err}");
-    //     std::process::exit(1);
-    // }
-
     let mut terminal = ratatui::init();
-    let app_result = App::new().run(&mut terminal);
+
+    let repo = Repository::open(".").map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let app = App::new(&repo).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+    let result = app.run(&mut terminal);
+
     ratatui::restore();
-    app_result
+    result
 }
