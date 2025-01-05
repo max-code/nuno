@@ -1,9 +1,12 @@
+mod git;
+mod ui;
+
 use std::io;
 
-use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use crossterm::event::{self, Event, KeyEvent, KeyEventKind};
 use ratatui::{
     buffer::Buffer,
-    layout::{Constraint, Layout, Rect},
+    layout::{Alignment, Constraint, Layout, Rect},
     style::{
         palette::tailwind::{GREEN, RED, SLATE, WHITE},
         Modifier, Style, Stylize,
@@ -15,46 +18,18 @@ use ratatui::{
     DefaultTerminal,
 };
 
-use git2::{Branch, Repository};
+use git2::Repository;
 
-#[derive(Default)]
-enum StatusType {
-    #[default]
-    Info,
-    Success,
-    Error,
-}
-
-impl StatusType {
-    fn get_emoji(&self) -> &'static str {
-        match self {
-            StatusType::Info => "ℹ️ ",
-            StatusType::Success => "✅",
-            StatusType::Error => "❌",
-        }
-    }
-}
-struct OperationStatus {
-    message: String,
-    status_type: StatusType,
-    timestamp: std::time::Instant,
-}
-
-impl Default for OperationStatus {
-    fn default() -> Self {
-        Self {
-            message: String::new(),
-            status_type: StatusType::default(),
-            timestamp: std::time::Instant::now(),
-        }
-    }
-}
+use git::branch_manager::BranchManager;
+use ui::controls::{Control, Controls};
+use ui::status::{OperationStatus, OperationStatusType};
 
 pub struct App<'repo> {
     branch_manager: BranchManager<'repo>,
     state: ListState,
     exit: bool,
     operation_status: OperationStatus,
+    controls: Controls,
 }
 
 impl<'a> Widget for &mut App<'a> {
@@ -90,6 +65,7 @@ impl<'repo> App<'repo> {
             exit: false,
             branch_manager,
             operation_status: OperationStatus::default(),
+            controls: Controls::new(),
         })
     }
 
@@ -119,29 +95,20 @@ impl<'repo> App<'repo> {
         ))
         .block(block)
         .bold()
-        .centered()
+        .alignment(Alignment::Center)
+        .fg(GREEN.c400)
         .render(area, buf);
     }
 
-    fn set_status(&mut self, message: &str, status_type: StatusType) {
-        self.operation_status = OperationStatus {
-            message: message.to_string(),
-            status_type,
-            timestamp: std::time::Instant::now(),
-        }
-    }
-
     fn render_status(&mut self, area: Rect, buf: &mut Buffer) {
-        if self.operation_status.timestamp.elapsed().as_secs() > 3
-            && !self.operation_status.message.is_empty()
-        {
+        if self.operation_status.is_expired_or_empty() {
             self.operation_status = OperationStatus::default();
         }
 
         let style = match self.operation_status.status_type {
-            StatusType::Info => Style::default().fg(WHITE),
-            StatusType::Success => Style::default().fg(GREEN.c500),
-            StatusType::Error => Style::default().fg(RED.c500),
+            OperationStatusType::Info => Style::default().fg(WHITE),
+            OperationStatusType::Success => Style::default().fg(GREEN.c400),
+            OperationStatusType::Error => Style::default().fg(RED.c500),
         };
 
         let emoji = self.operation_status.status_type.get_emoji();
@@ -161,9 +128,9 @@ impl<'repo> App<'repo> {
     }
 
     fn render_footer(&mut self, area: Rect, buf: &mut Buffer) {
-        Paragraph::new("Switch <s> | Fetch <f> | Refresh <r> | Quit <q>")
+        Paragraph::new(self.controls.format_help())
             .bold()
-            .centered()
+            .alignment(Alignment::Center)
             .render(area, buf);
     }
 
@@ -181,7 +148,7 @@ impl<'repo> App<'repo> {
                     .map(|(i, branch_name)| {
                         let bg_colour = if i % 2 == 0 { SLATE.c950 } else { SLATE.c900 };
                         let text_colour = if branch_name == &current_branch_name {
-                            GREEN.c500
+                            GREEN.c400
                         } else {
                             WHITE
                         };
@@ -215,20 +182,15 @@ impl<'repo> App<'repo> {
             return;
         }
 
-        match key.code {
-            KeyCode::Char('q') => self.exit = true,
-            KeyCode::Down => self.select_next(),
-            KeyCode::Up => self.select_previous(),
-            KeyCode::Char('s') => {
-                self.switch_branch();
+        if let Some(control) = self.controls.handle_key(key.code) {
+            match control {
+                Control::Quit => self.exit = true,
+                Control::Down => self.select_next(),
+                Control::Up => self.select_previous(),
+                Control::Switch => self.switch_branch(),
+                Control::Fetch => self.fetch_branch(),
+                Control::Refresh => self.refresh_branches(),
             }
-            KeyCode::Char('f') => {
-                self.fetch_branch();
-            }
-            KeyCode::Char('r') => {
-                self.refresh_branches();
-            }
-            _ => {}
         }
     }
 
@@ -248,9 +210,9 @@ impl<'repo> App<'repo> {
             .unwrap_or("unknown branch")
             .to_string();
 
-        self.set_status(
-            &format!("Switching to {}...", branch_name),
-            StatusType::Info,
+        self.operation_status.set(
+            format!("Switching to {}...", branch_name),
+            OperationStatusType::Info,
         );
 
         let result = self
@@ -261,19 +223,20 @@ impl<'repo> App<'repo> {
 
         match result {
             Some(Ok(_)) => {
-                self.set_status(
-                    &format!("Successfully switched to branch {}", branch_name),
-                    StatusType::Success,
+                self.operation_status.set(
+                    format!("Successfully switched to branch {}", branch_name),
+                    OperationStatusType::Success,
                 );
             }
             Some(Err(e)) => {
-                self.set_status(
-                    &format!("Error switching to {}: {}", branch_name, e),
-                    StatusType::Error,
+                self.operation_status.set(
+                    format!("Error switching to {}: {}", branch_name, e),
+                    OperationStatusType::Error,
                 );
             }
             None => {
-                self.set_status("No branch selected", StatusType::Info);
+                self.operation_status
+                    .set("No branch selected".to_string(), OperationStatusType::Info);
             }
         }
     }
@@ -289,7 +252,10 @@ impl<'repo> App<'repo> {
             .to_string(); // Clone the string so we own it
 
         // Now we can update status and use the branch
-        self.set_status(&format!("Fetching {}...", branch_name), StatusType::Info);
+        self.operation_status.set(
+            format!("Fetching {}...", branch_name),
+            OperationStatusType::Info,
+        );
 
         // Perform the fetch operation
         let result = self
@@ -301,117 +267,39 @@ impl<'repo> App<'repo> {
         // Update status based on result
         match result {
             Some(Ok(_)) => {
-                self.set_status(
-                    &format!("Successfully fetched {}", branch_name),
-                    StatusType::Success,
+                self.operation_status.set(
+                    format!("Successfully fetched {}", branch_name),
+                    OperationStatusType::Success,
                 );
             }
             Some(Err(e)) => {
-                self.set_status(
-                    &format!("Error fetching {}: {}", branch_name, e),
-                    StatusType::Error,
+                self.operation_status.set(
+                    format!("Error fetching {}: {}", branch_name, e),
+                    OperationStatusType::Error,
                 );
             }
             None => {
-                self.set_status("No branch selected", StatusType::Info);
+                self.operation_status
+                    .set("No branch selected".to_string(), OperationStatusType::Info);
             }
         }
     }
 
     fn refresh_branches(&mut self) {
-        if let Err(e) = self.branch_manager.refresh_branches() {
-            eprintln!("Failed to refresh branches: {}", e);
+        self.operation_status
+            .set("Refreshing".to_string(), OperationStatusType::Info);
+        match self.branch_manager.refresh_branches() {
+            Ok(_) => self.operation_status.set(
+                "Refreshed Branches".to_string(),
+                OperationStatusType::Success,
+            ),
+            Err(e) => {
+                self.operation_status.set(
+                    format!("Failed to refresh branches: {e}"),
+                    OperationStatusType::Error,
+                );
+            }
         }
-    }
-}
-
-struct BranchManager<'repo> {
-    repo: &'repo Repository,
-    local_branches: Vec<Branch<'repo>>,
-}
-
-impl<'repo> BranchManager<'repo> {
-    fn new(repo: &'repo Repository) -> Result<Self, git2::Error> {
-        let local_branches = repo
-            .branches(Some(git2::BranchType::Local))?
-            .filter_map(Result::ok)
-            .map(|(branch, _)| branch)
-            .collect();
-
-        Ok(Self {
-            repo,
-            local_branches,
-        })
-    }
-
-    fn refresh_branches(&mut self) -> Result<(), git2::Error> {
-        self.local_branches = self
-            .repo
-            .branches(Some(git2::BranchType::Local))?
-            .filter_map(Result::ok)
-            .map(|(branch, _)| branch)
-            .collect::<Vec<_>>();
-        Ok(())
-    }
-
-    fn get_all_local_branch_names(&self) -> Result<Vec<String>, git2::Error> {
-        Ok(self
-            .local_branches
-            .iter()
-            .filter_map(|branch| branch.name().ok()?.map(String::from))
-            .collect())
-    }
-
-    fn get_current_branch(&self) -> Result<String, git2::Error> {
-        let head = self.repo.head()?;
-
-        if head.is_branch() {
-            Ok(head.shorthand().unwrap_or("HEAD").to_string())
-        } else {
-            // Detached head state
-            let commit = head.peel_to_commit()?;
-            Ok(commit.id().to_string())
-        }
-    }
-
-    fn switch_to_branch(&self, branch: &Branch) -> Result<(), git2::Error> {
-        let branch_name = branch
-            .name()?
-            .ok_or_else(|| git2::Error::from_str("Invalid UTF-8 in branch name."))?;
-
-        let current_head_name = self.get_current_branch()?;
-
-        let statuses = self.repo.statuses(None)?;
-        if !statuses.is_empty() {
-            return Err(git2::Error::from_str(&format!(
-                "Uncommitted local changes on branch {}",
-                current_head_name,
-            )));
-        }
-
-        let mut opts = git2::build::CheckoutBuilder::new();
-
-        self.repo.set_head(&format!("refs/heads/{}", branch_name))?;
-        self.repo.checkout_head(Some(&mut opts))
-    }
-
-    fn fetch_on_branch(&self, branch: &Branch) -> Result<(), git2::Error> {
-        let branch_name = branch
-            .name()?
-            .ok_or_else(|| git2::Error::from_str("Invalid UTF-8 in branch name"))?;
-
-        let mut remote = self.repo.find_remote("origin")?;
-        let refspec = format!(
-            "+refs/heads/{}:refs/remotes/origin/{}",
-            branch_name, branch_name
-        );
-
-        let mut fetch_options = git2::FetchOptions::new();
-        fetch_options.download_tags(git2::AutotagOption::None);
-
-        remote.fetch(&[&refspec], Some(&mut fetch_options), None)?;
-
-        Ok(())
     }
 }
 
